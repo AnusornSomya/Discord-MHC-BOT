@@ -1,0 +1,14 @@
+{
+  "name": "discord-bot-mode-hardcore",
+  "version": "1.0.0",
+  "description": "Mode.[H]ardCore Discord Bot - welcome leave level verify invite",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "invite": "node invite.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.5"
+  }
+}
