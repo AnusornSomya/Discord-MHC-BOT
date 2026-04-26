@@ -31,13 +31,20 @@ const USERS_FILE = path.join(DATA_DIR, "users.json");
 
 const LEVEL_SECONDS_PER_LEVEL = 10 * 60;
 const VOICE_TICK_MS = 60 * 1000;
-const MAX_LEVEL = 1000;
+const MAX_LEVEL = 10000;
+const HIGH_LEVEL_START = 1000;
+const HIGH_LEVEL_TARGET_DAYS = 180;
+const HIGH_LEVEL_TARGET_SECONDS = HIGH_LEVEL_TARGET_DAYS * 24 * 60 * 60;
+const HIGH_LEVEL_STEP_SECONDS = HIGH_LEVEL_TARGET_SECONDS / (MAX_LEVEL - HIGH_LEVEL_START);
+const HIGH_LEVEL_ROLE_INTERVAL = 500;
+const HIGH_LEVEL_ROLE_START = HIGH_LEVEL_START + HIGH_LEVEL_ROLE_INTERVAL;
 const LEVEL_TIME_BRACKETS = [
   { minLevel: 1, maxLevel: 10, multiplier: 1, label: "Lv.1-10" },
   { minLevel: 11, maxLevel: 100, multiplier: 1.5, label: "Lv.11-100" },
   { minLevel: 101, maxLevel: 250, multiplier: 2, label: "Lv.101-250" },
   { minLevel: 251, maxLevel: 500, multiplier: 3, label: "Lv.251-500" },
-  { minLevel: 501, maxLevel: 1000, multiplier: 4.5, label: "Lv.501-1000" }
+  { minLevel: 501, maxLevel: 999, multiplier: 4.5, label: "Lv.501-999" },
+  { minLevel: HIGH_LEVEL_START, maxLevel: MAX_LEVEL, fixedSeconds: HIGH_LEVEL_STEP_SECONDS, label: "Lv.1000-10000" }
 ];
 const levelCurveCache = new Map();
 
@@ -74,7 +81,7 @@ const DEFAULT_USER = {
   verifiedAt: null
 };
 
-const LEVEL_ROLE_DEFINITIONS = [
+const LEGACY_LEVEL_ROLE_DEFINITIONS = [
   { level: 10, name: "[Lv.10] Rookie Raider", color: 0x95a5a6 },
   { level: 20, name: "[Lv.20] Iron Vanguard", color: 0x7f8c8d },
   { level: 30, name: "[Lv.30] Steel Reaper", color: 0x5d6d7e },
@@ -103,6 +110,58 @@ const LEVEL_ROLE_DEFINITIONS = [
   { level: 900, name: "[Lv.900] Rift Conqueror", color: 0x117864 },
   { level: 950, name: "[Lv.950] Mythic Apex", color: 0x154360 },
   { level: 1000, name: "[Lv.1000] Hardcore Legend", color: 0xf4d03f }
+];
+const HIGH_LEVEL_ROLE_TITLES = [
+  "Abyss Warlord",
+  "Titan Revenant",
+  "Chaos Tyrant",
+  "Rift Emperor",
+  "Mythic Overlord",
+  "Void Sovereign",
+  "Inferno Archon",
+  "Celestial Dominator",
+  "Doom Harbinger",
+  "Omega Monarch",
+  "Nightfall Regent",
+  "Stormbreaker Prime",
+  "Ashen Paragon",
+  "Oblivion Herald",
+  "Eternal Conqueror",
+  "Phantom Exarch",
+  "Crimson Apex",
+  "Hardcore Immortal"
+];
+const HIGH_LEVEL_ROLE_COLORS = [
+  0x1f618d,
+  0xba4a00,
+  0x2874a6,
+  0x117864,
+  0x6c3483,
+  0x2d3436,
+  0xc0392b,
+  0x7d3c98,
+  0x943126,
+  0x1abc9c,
+  0x2c3e50,
+  0x3498db,
+  0xd35400,
+  0x154360,
+  0xb9770e,
+  0x8e44ad,
+  0xe74c3c,
+  0xffd700
+];
+const HIGH_LEVEL_ROLE_DEFINITIONS = HIGH_LEVEL_ROLE_TITLES.map((title, index) => {
+  const level = HIGH_LEVEL_ROLE_START + (index * HIGH_LEVEL_ROLE_INTERVAL);
+  return {
+    level,
+    name: `[Lv.${level}] ${title}`,
+    color: HIGH_LEVEL_ROLE_COLORS[index % HIGH_LEVEL_ROLE_COLORS.length]
+  };
+});
+const LEVEL_ROLE_DEFINITIONS = [
+  ...LEGACY_LEVEL_ROLE_DEFINITIONS,
+  ...HIGH_LEVEL_ROLE_DEFINITIONS
 ];
 const TOP_LEVEL_ROLE_DEFINITION = {
   name: "[Top 1] Hardcore Crown",
@@ -239,6 +298,14 @@ function normalizeLevelStepSeconds(secondsPerLevel = LEVEL_SECONDS_PER_LEVEL) {
   return Math.max(1, Math.floor(Number(secondsPerLevel) || LEVEL_SECONDS_PER_LEVEL));
 }
 
+function getBracketRequiredSeconds(bracket, secondsPerLevel = LEVEL_SECONDS_PER_LEVEL) {
+  if (Number.isFinite(bracket?.fixedSeconds) && bracket.fixedSeconds > 0) {
+    return Math.max(60, Math.round(bracket.fixedSeconds));
+  }
+
+  return Math.max(60, Math.round(normalizeLevelStepSeconds(secondsPerLevel) * bracket.multiplier));
+}
+
 function getLevelTimeBracket(level) {
   const safeLevel = Math.max(1, Math.min(MAX_LEVEL, Math.floor(Number(level) || 1)));
   return LEVEL_TIME_BRACKETS.find((bracket) => safeLevel >= bracket.minLevel && safeLevel <= bracket.maxLevel)
@@ -256,7 +323,7 @@ function getLevelCurve(secondsPerLevel = LEVEL_SECONDS_PER_LEVEL) {
 
   for (let level = 1; level < MAX_LEVEL; level += 1) {
     const bracket = getLevelTimeBracket(level);
-    const requiredSeconds = Math.max(60, Math.round(baseSeconds * bracket.multiplier));
+    const requiredSeconds = getBracketRequiredSeconds(bracket, baseSeconds);
     stepSeconds[level] = requiredSeconds;
     thresholds[level + 1] = thresholds[level] + requiredSeconds;
   }
@@ -282,7 +349,7 @@ function getSecondsRequiredForNextLevel(level, secondsPerLevel = LEVEL_SECONDS_P
 
 function getLevelRateDescriptionLines(secondsPerLevel = LEVEL_SECONDS_PER_LEVEL, prefix = "• ") {
   return LEVEL_TIME_BRACKETS.map((bracket) => (
-    `${prefix}${bracket.label}: ${formatDuration(getSecondsRequiredForNextLevel(bracket.minLevel, secondsPerLevel))} / เลเวล`
+    `${prefix}${bracket.label}: ${formatDuration(getBracketRequiredSeconds(bracket, secondsPerLevel))} / เลเวล`
   ));
 }
 
@@ -485,6 +552,7 @@ function formatDuration(totalSeconds) {
   if (days) parts.push(`${days} วัน`);
   if (hours) parts.push(`${hours} ชม.`);
   if (minutes) parts.push(`${minutes} นาที`);
+  if (!days && !hours && seconds) parts.push(`${seconds} วินาที`);
   if (!parts.length) parts.push(`${seconds} วินาที`);
 
   return parts.join(" ");
@@ -640,8 +708,11 @@ function buildPanelEmbed(guild) {
         "คนเลเวลสูงสุดจะได้ยศพิเศษ 1 คน",
         "ถ้ามีคนเลเวลแซง ยศจะย้ายไปคนใหม่อัตโนมัติ",
         "นับเวลาจากทุกห้องเสียงในเซิร์ฟเวอร์",
+        `ถึง Lv.${HIGH_LEVEL_START} ยังใช้สูตรเลเวลเดิม`,
+        `หลัง Lv.${HIGH_LEVEL_START} ไปจนถึง Lv.${MAX_LEVEL} ใช้เวลาอีก ${formatDuration(HIGH_LEVEL_TARGET_SECONDS)} (ประมาณ 6 เดือน)`,
         "ยศช่วง Lv.1-100: ทุก 10 เลเวล",
         "ยศช่วง Lv.100-1000: ทุก 50 เลเวล",
+        `ยศช่วง Lv.${HIGH_LEVEL_ROLE_START}-${MAX_LEVEL}: ทุก ${HIGH_LEVEL_ROLE_INTERVAL} เลเวล`,
         `จำนวนยศทั้งหมด: ${LEVEL_ROLE_DEFINITIONS.length} ยศ`,
         "",
         "-- สถานะเซิร์ฟเวอร์ --",
@@ -698,11 +769,14 @@ function buildLevelPageEmbed(guild) {
         "• เวลาอัปเลเวลจะเพิ่มขึ้นตามช่วงเลเวล",
         ...getLevelRateDescriptionLines(settings.levelSystem.secondsPerLevel),
         "• เข้าห้องเสียงไหนก็ได้เวลาทั้งหมด",
-        "• เลเวลสูงสุด 1000",
+        `• เลเวลสูงสุด ${MAX_LEVEL}`,
+        `• ถึง Lv.${HIGH_LEVEL_START} ยังใช้สูตรเลเวลเดิม`,
+        `• จาก Lv.${HIGH_LEVEL_START} ไป Lv.${MAX_LEVEL} ต้องสะสมเวลาเพิ่มอีก ${formatDuration(HIGH_LEVEL_TARGET_SECONDS)} (ประมาณ 6 เดือน)`,
         "• คนเลเวลสูงสุดของเซิร์ฟจะได้ยศพิเศษเพียง 1 คน",
         "• ถ้ามีคนเลเวลแซง ยศนี้จะถูกย้ายให้ผู้เล่นคนนั้นอัตโนมัติ",
         "• ช่วง Lv.1 - Lv.100 ได้ยศทุก 10 เลเวล",
         "• ช่วง Lv.100 - Lv.1000 ได้ยศทุก 50 เลเวล",
+        `• ช่วง Lv.${HIGH_LEVEL_ROLE_START} - Lv.${MAX_LEVEL} ได้ยศทุก ${HIGH_LEVEL_ROLE_INTERVAL} เลเวล`,
         "",
         "กดปุ่มด้านล่างเพื่อตรวจสอบเลเวลของคุณ"
       ].join("\n")
