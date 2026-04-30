@@ -62,6 +62,16 @@ const DEFAULT_GUILD_SETTINGS = {
     enabled: true,
     logChannelId: null
   },
+  memberStats: {
+    enabled: false,
+    categoryId: null,
+    channelIds: {
+      online: null,
+      members: null,
+      bots: null,
+      voice: null
+    }
+  },
   levelSystem: {
     secondsPerLevel: LEVEL_SECONDS_PER_LEVEL,
     rankRoles: {},
@@ -167,6 +177,15 @@ const TOP_LEVEL_ROLE_DEFINITION = {
   name: "[Top 1] Hardcore Crown",
   color: 0xffd700
 };
+const MEMBER_STATS_CATEGORY_NAME = "✦ Server Stats ✦";
+const MEMBER_STATS_CHANNEL_DEFINITIONS = [
+  { key: "online", label: "🟢・Online" },
+  { key: "members", label: "👤・Members" },
+  { key: "bots", label: "🤖・Bots" },
+  { key: "voice", label: "🔊・In Voice" }
+];
+const MEMBER_STATS_REFRESH_DEBOUNCE_MS = 5000;
+const memberStatsRefreshTimers = new Map();
 
 function hasOwn(obj, key) {
   return Object.prototype.hasOwnProperty.call(obj, key);
@@ -211,6 +230,14 @@ function normalizeGuildSettings(settings = {}) {
       ...DEFAULT_GUILD_SETTINGS.voiceNotify,
       ...(rawSettings.voiceNotify || {})
     },
+    memberStats: {
+      ...DEFAULT_GUILD_SETTINGS.memberStats,
+      ...(rawSettings.memberStats || {}),
+      channelIds: {
+        ...DEFAULT_GUILD_SETTINGS.memberStats.channelIds,
+        ...((rawSettings.memberStats && rawSettings.memberStats.channelIds) || {})
+      }
+    },
     levelSystem: {
       ...DEFAULT_GUILD_SETTINGS.levelSystem,
       ...(rawSettings.levelSystem || {})
@@ -225,6 +252,14 @@ function normalizeGuildSettings(settings = {}) {
   merged.voiceNotify.logChannelId = merged.voiceNotify.logChannelId
     ? String(merged.voiceNotify.logChannelId)
     : null;
+  merged.memberStats.enabled = Boolean(merged.memberStats.enabled);
+  merged.memberStats.categoryId = merged.memberStats.categoryId
+    ? String(merged.memberStats.categoryId)
+    : null;
+  merged.memberStats.channelIds = Object.entries(merged.memberStats.channelIds || {}).reduce((acc, [key, channelId]) => {
+    acc[String(key)] = channelId ? String(channelId) : null;
+    return acc;
+  }, { ...DEFAULT_GUILD_SETTINGS.memberStats.channelIds });
 
   merged.levelSystem.rankRoles = Object.entries(merged.levelSystem.rankRoles || {}).reduce((acc, [level, roleId]) => {
     if (roleId) {
@@ -253,7 +288,7 @@ function normalizeGuildSettings(settings = {}) {
 }
 
 function isLegacyGuildSettings(raw) {
-  return ["welcome", "leave", "level", "verify", "registrationRoleId", "welcomeChannelId", "leaveChannelId", "levelUpChannelId", "panelChannelId", "voiceNotify", "levelSystem"].some((key) =>
+  return ["welcome", "leave", "level", "verify", "registrationRoleId", "welcomeChannelId", "leaveChannelId", "levelUpChannelId", "panelChannelId", "voiceNotify", "memberStats", "levelSystem"].some((key) =>
     hasOwn(raw, key)
   );
 }
@@ -537,6 +572,175 @@ function getLevelUpLogChannel(guild, settings) {
   );
 }
 
+function getGuildMemberStats(guild) {
+  const members = [...guild.members.cache.values()];
+  const humanMembers = members.filter((member) => !member.user.bot);
+  const bots = members.length - humanMembers.length;
+  const online = humanMembers.filter((member) => member.presence && member.presence.status !== "offline").length;
+  const voice = [...guild.voiceStates.cache.values()].filter(isCountableVoiceState).length;
+
+  return {
+    online,
+    members: humanMembers.length,
+    bots,
+    voice
+  };
+}
+
+function buildMemberStatsChannelName(definition, stats) {
+  return `${definition.label} ${stats[definition.key] ?? 0}`;
+}
+
+function getMemberStatsSetupErrorMessage(error) {
+  if (error?.message === "BOT_NEEDS_MANAGE_CHANNELS") {
+    return "บอทต้องมีสิทธิ์ Manage Channels ก่อน ถึงจะสร้างห้องสถิติให้อัตโนมัติได้";
+  }
+
+  return "สร้างห้องสถิติไม่สำเร็จ ตรวจสิทธิ์ของบอทแล้วลองใหม่อีกครั้ง";
+}
+
+async function ensureMemberStatsChannels(guild, settings = null) {
+  const me = guild.members.me;
+  if (!me || !me.permissions.has(PermissionFlagsBits.ManageChannels)) {
+    throw new Error("BOT_NEEDS_MANAGE_CHANNELS");
+  }
+
+  const guildSettings = settings || getGuildSettings(guild.id);
+  const memberStats = guildSettings.memberStats;
+  let changed = false;
+
+  let category = memberStats.categoryId ? guild.channels.cache.get(memberStats.categoryId) || null : null;
+  if (category && category.type !== ChannelType.GuildCategory) {
+    category = null;
+  }
+
+  if (!category) {
+    category = guild.channels.cache.find((channel) => (
+      channel.type === ChannelType.GuildCategory &&
+      channel.name === MEMBER_STATS_CATEGORY_NAME
+    )) || null;
+  }
+
+  if (!category) {
+    category = await guild.channels.create({
+      name: MEMBER_STATS_CATEGORY_NAME,
+      type: ChannelType.GuildCategory,
+      reason: "Create member stats category"
+    });
+  }
+
+  if (memberStats.categoryId !== category.id) {
+    memberStats.categoryId = category.id;
+    changed = true;
+  }
+
+  const stats = getGuildMemberStats(guild);
+  const channels = {};
+
+  for (const definition of MEMBER_STATS_CHANNEL_DEFINITIONS) {
+    let channel = memberStats.channelIds[definition.key]
+      ? guild.channels.cache.get(memberStats.channelIds[definition.key]) || null
+      : null;
+
+    if (channel && channel.type !== ChannelType.GuildVoice) {
+      channel = null;
+    }
+
+    if (!channel) {
+      channel = guild.channels.cache.find((existingChannel) => (
+        existingChannel.type === ChannelType.GuildVoice &&
+        existingChannel.parentId === category.id &&
+        existingChannel.name.startsWith(definition.label)
+      )) || null;
+    }
+
+    if (!channel) {
+      channel = await guild.channels.create({
+        name: buildMemberStatsChannelName(definition, stats),
+        type: ChannelType.GuildVoice,
+        parent: category.id,
+        permissionOverwrites: [
+          {
+            id: guild.roles.everyone.id,
+            deny: [PermissionFlagsBits.Connect]
+          }
+        ],
+        reason: "Create member stats channel"
+      });
+    } else {
+      if (channel.parentId !== category.id) {
+        await channel.setParent(category.id, { lockPermissions: false }).catch(() => {});
+      }
+
+      const everyoneOverwrite = channel.permissionOverwrites.cache.get(guild.roles.everyone.id);
+      if (!everyoneOverwrite?.deny.has(PermissionFlagsBits.Connect)) {
+        await channel.permissionOverwrites.edit(guild.roles.everyone, { Connect: false }).catch(() => {});
+      }
+    }
+
+    channels[definition.key] = channel;
+
+    if (memberStats.channelIds[definition.key] !== channel.id) {
+      memberStats.channelIds[definition.key] = channel.id;
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    saveGuildSettings(guild.id, guildSettings);
+  }
+
+  return { category, channels, settings: guildSettings };
+}
+
+async function updateMemberStatsChannels(guild, settings = null) {
+  const guildSettings = settings || getGuildSettings(guild.id);
+  if (!guildSettings.memberStats.enabled) {
+    return;
+  }
+
+  const { channels } = await ensureMemberStatsChannels(guild, guildSettings);
+  const stats = getGuildMemberStats(guild);
+
+  for (const definition of MEMBER_STATS_CHANNEL_DEFINITIONS) {
+    const channel = channels[definition.key];
+    if (!channel) {
+      continue;
+    }
+
+    const desiredName = buildMemberStatsChannelName(definition, stats);
+    if (channel.name !== desiredName) {
+      await channel.edit({
+        name: desiredName,
+        reason: "Update member stats channel count"
+      }).catch(() => {});
+    }
+  }
+}
+
+function queueMemberStatsRefresh(guild) {
+  if (!guild) {
+    return;
+  }
+
+  const settings = getGuildSettings(guild.id);
+  if (!settings.memberStats.enabled) {
+    return;
+  }
+
+  const existingTimer = memberStatsRefreshTimers.get(guild.id);
+  if (existingTimer) {
+    clearTimeout(existingTimer);
+  }
+
+  const timer = setTimeout(() => {
+    memberStatsRefreshTimers.delete(guild.id);
+    updateMemberStatsChannels(guild).catch(() => {});
+  }, MEMBER_STATS_REFRESH_DEBOUNCE_MS);
+
+  memberStatsRefreshTimers.set(guild.id, timer);
+}
+
 function statusText(enabled) {
   return enabled ? "🟢 เปิด" : "🔴 ปิด";
 }
@@ -691,6 +895,7 @@ function buildPanelEmbed(guild) {
         `ฟอร์มกรอกข้อมูล/เปลี่ยนชื่อ: ${statusText(settings.verify)}`,
         `เลเวลจากห้องเสียง: ${statusText(settings.level)}`,
         `แจ้งเตือนเข้าออกห้องเสียง: ${statusText(settings.voiceNotify.enabled)}`,
+        `ห้องสถิติสมาชิก: ${statusText(settings.memberStats.enabled)}`,
         "",
         "-- ห้องที่ระบบใช้ --",
         `ห้อง log หลัก: ${settings.panelChannelId ? `<#${settings.panelChannelId}>` : "ยังไม่ตั้งค่า"}`,
@@ -698,6 +903,7 @@ function buildPanelEmbed(guild) {
         `ห้องแจ้งออกเซิร์ฟ: ${formatChannelMention(guild, settings.leaveChannelId, "ใช้ห้อง log หลัก")}`,
         `ห้องแจ้งเตือนห้องเสียง: ${formatChannelMention(guild, settings.voiceNotify.logChannelId, "ใช้ห้อง log หลัก")}`,
         `ห้องประกาศเลเวลอัป: ${formatChannelMention(guild, settings.levelUpChannelId, "ใช้ห้อง log หลัก")}`,
+        `หมวดห้องสถิติ: ${formatChannelMention(guild, settings.memberStats.categoryId, "ยังไม่ได้สร้าง")}`,
         `ยศหลังลงทะเบียน: ${registrationRole ? registrationRole.toString() : "ยังไม่ได้เลือก"}`,
         `ยศพิเศษคนอันดับ 1: ${topLeaderRole}`,
         `ผู้ถือยศปัจจุบัน: ${topLeaderUser}`,
@@ -956,6 +1162,10 @@ function buildPanelRows(guild) {
       new ButtonBuilder()
         .setCustomId("setup_level_roles")
         .setLabel("สร้างยศเลเวล")
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId("setup_member_stats")
+        .setLabel("สร้างห้องสถิติ")
         .setStyle(ButtonStyle.Primary)
     ),
     new ActionRowBuilder().addComponents(roleSelector),
@@ -1319,6 +1529,7 @@ const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildPresences,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildVoiceStates
@@ -1430,6 +1641,11 @@ client.once("ready", async () => {
 
   for (const guild of client.guilds.cache.values()) {
     const settings = getGuildSettings(guild.id);
+    if (settings.memberStats.enabled) {
+      await guild.members.fetch({ withPresences: true }).catch(() => {});
+      await updateMemberStatsChannels(guild, settings).catch(() => {});
+    }
+
     if (!settings.level) {
       continue;
     }
@@ -1455,6 +1671,7 @@ client.on("guildMemberAdd", async (member) => {
   }
 
   await restoreMemberState(member).catch(() => {});
+  queueMemberStatsRefresh(member.guild);
 });
 
 client.on("guildMemberRemove", async (member) => {
@@ -1476,12 +1693,24 @@ client.on("guildMemberRemove", async (member) => {
   if (settings.level) {
     await syncTopLeaderRole(member.guild).catch(() => {});
   }
+
+  queueMemberStatsRefresh(member.guild);
+});
+
+client.on("presenceUpdate", async (_oldPresence, newPresence) => {
+  if (!newPresence?.guild) {
+    return;
+  }
+
+  queueMemberStatsRefresh(newPresence.guild);
 });
 
 client.on("voiceStateUpdate", async (oldState, newState) => {
   const guild = newState.guild;
   const settings = getGuildSettings(guild.id);
   const member = newState.member || oldState.member;
+
+  queueMemberStatsRefresh(guild);
 
   if (!member || member.user.bot || !settings.voiceNotify.enabled) {
     return;
@@ -1586,6 +1815,7 @@ client.on("interactionCreate", async (interaction) => {
       "toggle_level",
       "toggle_voice_notify",
       "setup_level_roles",
+      "setup_member_stats",
       "clear_welcome_channel",
       "clear_leave_channel",
       "clear_voice_notify_channel",
@@ -1730,6 +1960,31 @@ client.on("interactionCreate", async (interaction) => {
 
       await refreshPanelMessage(interaction.message);
       await interaction.editReply(`สร้าง/ตรวจยศเลเวล ${LEVEL_ROLE_DEFINITIONS.length} ยศ พร้อมยศพิเศษอันดับ 1 แล้ว และซิงก์สมาชิก ${syncedCount} คน`);
+      return;
+    }
+
+    if (interaction.customId === "setup_member_stats") {
+      await interaction.deferReply({ ephemeral: true });
+
+      const previousEnabled = settings.memberStats.enabled;
+      settings.memberStats.enabled = true;
+      settings.panelChannelId = interaction.channelId || settings.panelChannelId;
+      saveGuildSettings(interaction.guild.id, settings);
+
+      try {
+        await interaction.guild.members.fetch({ withPresences: true }).catch(() => {});
+        await updateMemberStatsChannels(interaction.guild, settings);
+      } catch (error) {
+        settings.memberStats.enabled = previousEnabled;
+        saveGuildSettings(interaction.guild.id, settings);
+        await interaction.editReply(getMemberStatsSetupErrorMessage(error));
+        return;
+      }
+
+      await refreshPanelMessage(interaction.message);
+      await interaction.editReply(
+        `สร้าง/ซิงก์ห้องสถิติ ${MEMBER_STATS_CHANNEL_DEFINITIONS.length} ห้องแล้ว หากตัวเลข Online ไม่อัปเดต ให้เปิด Presence Intent ใน Discord Developer Portal`
+      );
       return;
     }
 
