@@ -185,7 +185,9 @@ const MEMBER_STATS_CHANNEL_DEFINITIONS = [
   { key: "voice", label: "🔊・In Voice" }
 ];
 const MEMBER_STATS_REFRESH_DEBOUNCE_MS = 5000;
+const VOICE_STATE_RESYNC_COOLDOWN_MS = 60 * 1000;
 const memberStatsRefreshTimers = new Map();
+const voiceStateResyncTimestamps = new Map();
 
 function hasOwn(obj, key) {
   return Object.prototype.hasOwnProperty.call(obj, key);
@@ -572,12 +574,54 @@ function getLevelUpLogChannel(guild, settings) {
   );
 }
 
-function getGuildMemberStats(guild) {
+function getCountableVoiceStates(guild) {
+  return [...guild.voiceStates.cache.values()].filter(isCountableVoiceState);
+}
+
+async function reconcileGuildVoiceStates(guild, { force = false } = {}) {
+  const now = Date.now();
+  const lastResyncAt = voiceStateResyncTimestamps.get(guild.id) || 0;
+
+  if (!force && now - lastResyncAt < VOICE_STATE_RESYNC_COOLDOWN_MS) {
+    return;
+  }
+
+  voiceStateResyncTimestamps.set(guild.id, now);
+
+  const cachedActiveVoiceUserIds = getCountableVoiceStates(guild).map((voiceState) => voiceState.id);
+  if (!cachedActiveVoiceUserIds.length) {
+    return;
+  }
+
+  const results = await Promise.allSettled(
+    cachedActiveVoiceUserIds.map((userId) => guild.voiceStates.fetch(userId, { force: true, cache: true }))
+  );
+
+  results.forEach((result, index) => {
+    const userId = cachedActiveVoiceUserIds[index];
+    if (result.status === "rejected") {
+      if (result.reason?.status === 404) {
+        guild.voiceStates.cache.delete(userId);
+      }
+      return;
+    }
+
+    if (!result.value?.channelId) {
+      guild.voiceStates.cache.delete(userId);
+    }
+  });
+}
+
+async function getGuildMemberStats(guild, { refreshVoiceStates = false } = {}) {
+  if (refreshVoiceStates) {
+    await reconcileGuildVoiceStates(guild).catch(() => {});
+  }
+
   const members = [...guild.members.cache.values()];
   const humanMembers = members.filter((member) => !member.user.bot);
   const bots = members.length - humanMembers.length;
   const online = humanMembers.filter((member) => member.presence && member.presence.status !== "offline").length;
-  const voice = [...guild.voiceStates.cache.values()].filter(isCountableVoiceState).length;
+  const voice = getCountableVoiceStates(guild).length;
 
   return {
     online,
@@ -634,7 +678,7 @@ async function ensureMemberStatsChannels(guild, settings = null) {
     changed = true;
   }
 
-  const stats = getGuildMemberStats(guild);
+  const stats = await getGuildMemberStats(guild, { refreshVoiceStates: true });
   const channels = {};
 
   for (const definition of MEMBER_STATS_CHANNEL_DEFINITIONS) {
@@ -700,7 +744,7 @@ async function updateMemberStatsChannels(guild, settings = null) {
   }
 
   const { channels } = await ensureMemberStatsChannels(guild, guildSettings);
-  const stats = getGuildMemberStats(guild);
+  const stats = await getGuildMemberStats(guild);
 
   for (const definition of MEMBER_STATS_CHANNEL_DEFINITIONS) {
     const channel = channels[definition.key];
@@ -778,6 +822,10 @@ function formatRoleMention(guild, roleId, fallback = "à¸¢à¸±à¸‡à¹„
 
   const role = guild.roles.cache.get(roleId);
   return role ? role.toString() : fallback;
+}
+
+function formatMemberAnnouncementName(member) {
+  return String(member?.displayName || member?.user?.globalName || member?.user?.username || "Member").replace(/@/g, "@\u200b");
 }
 
 function getRegistrationRoleId(settings) {
@@ -1608,11 +1656,14 @@ async function processVoiceLevelTick() {
         }
 
         const user = users[levelUp.member.id];
+        const previousRank = getHighestRankDefinition(levelUp.previousLevel);
         const currentRank = getHighestRankDefinition(user.level);
+        const earnedNewRank = (previousRank?.level || null) !== (currentRank?.level || null);
+        const memberLabel = earnedNewRank ? levelUp.member.toString() : formatMemberAnnouncementName(levelUp.member);
 
         await announceChannel.send({
           content: [
-            `🎉 ${levelUp.member} เลเวลอัปเป็น Lv.${levelUp.currentLevel}`,
+            `🎉 ${memberLabel} เลเวลอัปเป็น Lv.${levelUp.currentLevel}`,
             `เวลาในห้องเสียงสะสม: ${formatDuration(user.voiceSeconds)}`,
             currentRank ? `ยศล่าสุด: **${currentRank.name}**` : null
           ].filter(Boolean).join("\n")
@@ -1771,12 +1822,31 @@ client.on("messageCreate", async (message) => {
     return;
   }
 
-  if (message.content.trim().toLowerCase() !== "!panel") {
+  const command = message.content.trim().toLowerCase();
+  if (!["!panel", "!voicecheck"].includes(command)) {
     return;
   }
 
   if (!isAdminMember(message.member)) {
     await message.reply("คำสั่งนี้ใช้ได้เฉพาะแอดมิน");
+    return;
+  }
+
+  if (command === "!voicecheck") {
+    await reconcileGuildVoiceStates(message.guild, { force: true }).catch(() => {});
+    const voiceStates = getCountableVoiceStates(message.guild);
+
+    const detailLines = voiceStates.slice(0, 20).map((voiceState) => (
+      `• ${formatMemberAnnouncementName(voiceState.member)} -> ${voiceState.channel?.name || "Unknown Channel"}`
+    ));
+    const remainingCount = Math.max(0, voiceStates.length - detailLines.length);
+
+    await updateMemberStatsChannels(message.guild, getGuildSettings(message.guild.id)).catch(() => {});
+    await message.reply([
+      `In Voice ที่บอทนับตอนนี้: ${voiceStates.length}`,
+      ...detailLines,
+      remainingCount ? `และอีก ${remainingCount} คน` : null
+    ].filter(Boolean).join("\n"));
     return;
   }
 
